@@ -1,138 +1,176 @@
-from sklearn.tree import DecisionTreeClassifier
-import pandas as pd
+# scripts/decisionTree.py
+from __future__ import annotations
+
 import os
-import helperFuncs
+import argparse
+from pathlib import Path
+from typing import Tuple, Dict, Any, Optional
 
-# Get the directory this script is in
-CURRENT_DIR = os.path.dirname(__file__)
+import numpy as np
+import pandas as pd
+from sklearn.tree import DecisionTreeClassifier
 
-# Go up one level to the project root
-PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
+import helperFuncs  # relies on app adding ./scripts to sys.path
 
-# Build the path to the data file
-DATA_PATH = os.path.join(PROJECT_ROOT, "data", "ieee_fraud_features_encoded.parquet")
-
-
-AMOUNT_COL = "TransactionAmt"
-TIME_COL = "TransactionDT"
 TARGET = "isFraud"
 
+# --------------------------------
+# Project-relative default paths
+# --------------------------------
+CURRENT_DIR = os.path.dirname(__file__)
+PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
+DATA_DIR = os.path.join(PROJECT_ROOT, "data")
+
+TRAIN_PATH = os.path.join(DATA_DIR, "fraud_train_reduced.parquet")
+VAL_PATH   = os.path.join(DATA_DIR, "fraud_val_reduced.parquet")
+
+# --------------------------------
+# Core miner
+# --------------------------------
 def run_miner(
-    df: pd.DataFrame,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_val: pd.DataFrame,
+    y_val: pd.Series,
     *,
-    n_bootstraps: int = 100,
-    max_depth: int = 3,
+    n_bootstraps: int = 1000,
+    max_depth: int = 5,
     min_samples_leaf: int = 5,
-    bootstrap_ratio: int = 3,
     min_votes_post: int = 5,
-    snap_step: int = 10
-    ): 
-    max_depth = 3
-    min_sample_leaf = 5
+    bootstrap_ratio: int = 1,     # 1:1 nonfraud:fraud in each bootstrap
+    seed: int = 42
+) -> Tuple[pd.DataFrame, list[Dict[str, Any]], float]:
+    """
+    Bootstrap-mined decision-tree leaves → rules → postprocess → evaluate on X_val/y_val.
+    Returns: (rule_eval_df, cleaned_rules, baseline_val_rate)
+    """
+    feature_names = X_train.columns.tolist()
 
-    GROUP_MAP = {
-        "ProductCD_": "ProductCD",
-        "card6_": "card6",
-        "card4_": "card4",
-    }
+    # Build index pools for stratified bootstrap
+    fraud_idx = y_train[y_train == 1].index.to_numpy()
+    ok_idx    = y_train[y_train == 0].index.to_numpy()
 
-    # (Optional) full level lists per group if you want NOT IN for negative-only rules.
-    # Example enumerations; adjust to match your encoding.
-    GROUP_LEVELS = {
-        "ProductCD_": ["W","R","H","S","C"],
-        "card6_": ["credit","debit","charge","debit_or_credit"],
-        "card4_": ["visa","mastercard","discover","american_express"],
-    }
-
-    df = df.drop(columns=["card1", "card2", "card3", "card5"], errors="ignore", axis=1)
-
-    n_bootstraps = 100
-
-    split = helperFuncs.sampleSplit(df=df, TIME_COL=TIME_COL, TARGET=TARGET)
-
-    X_train       = split["X_train"]
-    y_train       = split["y_train"]
-    X_val         = split["X_val"]
-    y_val         = split["y_val"]
-    fraud_idx     = split["fraud_idx"]    # numpy array of int indices
-    ok_idx        = split["ok_idx"]       # numpy array of int indices
-    feature_names = split["feature_names"]
-
-
-
-    # 2) Bootstrap loop → fit shallow tree → extract raw leaf paths
-    rules_tally = {}  # dict keyed by canonical rule; value holds {"votes": int, "clauses": ...}
+    rules_tally: Dict[str, Dict[str, Any]] = {}
+    rng = np.random.default_rng(seed)
 
     for i in range(n_bootstraps):
-        # 2a) draw bootstrap indices from the *train* set
-        idx = helperFuncs.stratified_bootstrap_ratio(fraud_idx=fraud_idx, ok_idx=ok_idx, ratio=1)
+        # draw bootstrapped indices (fraud with replacement, ok with replacement at `ratio`)
+        K = len(fraud_idx)
+        if K == 0 or len(ok_idx) == 0:
+            break  # nothing to sample
+        M = max(bootstrap_ratio * K, 1)
+        fraud_sample = rng.choice(fraud_idx, size=K, replace=True)
+        ok_sample    = rng.choice(ok_idx,    size=M, replace=True)
+        idx = rng.permutation(np.concatenate([fraud_sample, ok_sample]))
 
-        # 2b) subset
-        X_boot = X_train.iloc[idx]
-        y_boot = y_train.iloc[idx]
+        X_boot = X_train.loc[idx]
+        y_boot = y_train.loc[idx]
 
-        # 2c) fit depth-2 tree
-        tree = DecisionTreeClassifier(max_depth=max_depth, min_samples_leaf=min_sample_leaf, random_state=42 + i)
+        tree = DecisionTreeClassifier(
+            max_depth=max_depth,
+            min_samples_leaf=min_samples_leaf,
+            random_state=1234 + i
+        )
         tree.fit(X_boot, y_boot)
 
-        # 2d) extract raw paths (use the dfs you wrote)
         leaves = helperFuncs.dfs_leaf_paths(tree, feature_names, positive_class=1, keep_all=False)
 
-        # 2e) for each leaf path: clean → canonicalize → tally
         for leaf in leaves:
-            raw_path = leaf["path"]
-
-            # CLEAN & MERGE (your functions; placeholders here)
-            norm_clauses = helperFuncs.clean_and_merge(raw_path)       # snap $10, integerize hour/day, one-hot @0.5
-            if not norm_clauses:
+            norm = helperFuncs.clean_and_merge(leaf["path"])
+            if not norm:
                 continue
-
-            key = helperFuncs.canonical_key(norm_clauses)              # sorted, hashable tuple
-
+            key = helperFuncs.canonical_key(norm)
             rec = rules_tally.get(key)
             if rec is None:
-                rules_tally[key] = {"votes": 1, "clauses": norm_clauses}
+                rules_tally[key] = {"votes": 1, "clauses": norm}
             else:
                 rec["votes"] += 1
 
-    # 3) Turn into a list sorted by votes when you’re ready to export
-    candidates = sorted(
-        ({"key": k, "votes": v["votes"], "clauses": v["clauses"]} for k, v in rules_tally.items()),
-        key=lambda d: d["votes"],
-        reverse=True
-    )
+    candidates = [
+        {"key": k, "votes": v["votes"], "clauses": v["clauses"]}
+        for k, v in rules_tally.items()
+    ]
+    cleaned = helperFuncs.postprocess_rules(candidates, min_votes=min_votes_post)
 
-    cleaned = helperFuncs.postprocess_rules(candidates, min_votes=5, snap_step=10)
+    rule_eval = helperFuncs.evaluate_rules(cleaned, X_val, y_val, min_support=20)
 
-    rule_eval = helperFuncs.evaluate_rules(rules = cleaned, X_val=X_val, y_val=y_val, min_support=20)
-
-    baseline_val = df["isFraud"].mean()  # fraction of rows where isFraud == 1
-    sql_outputs = []
-    english_outputs = []
-
+    # render SQL + English
+    sql_where_list, english_list = [], []
     for _, row in rule_eval.iterrows():
-        clauses = row["rule"]
-        sql_where, english = helperFuncs.clauses_to_sql_where_pretty(clauses)
-        sql_outputs.append(sql_where)
-        english_outputs.append(english)
+        sql_where, english = helperFuncs.clauses_to_sql_where_pretty(row["rule"])
+        sql_where_list.append(sql_where)
+        english_list.append(english)
+    rule_eval["sql_where"] = sql_where_list
+    rule_eval["english"] = english_list
 
-    # Add back into your DataFrame
-    rule_eval["sql_where"] = sql_outputs
-    rule_eval["english"] = english_outputs
-
+    baseline_val = float(y_val.mean())
     return rule_eval, cleaned, baseline_val
 
-# --- keep script mode for convenience ---
+# --------------------------------
+# Convenience wrappers for Streamlit / legacy calls
+# --------------------------------
+def _xy_from_df(df: pd.DataFrame, target: str = TARGET) -> tuple[pd.DataFrame, pd.Series]:
+    y = df[target].astype(int)
+    X = df.drop(columns=[target], errors="ignore")
+    return X, y
+
+def run_miner_from_frames(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    **kwargs
+) -> Tuple[pd.DataFrame, list[Dict[str, Any]], float]:
+    """
+    Convenience wrapper: accept full train/val frames (with target col) and mine rules.
+    """
+    X_train, y_train = _xy_from_df(train_df)
+    X_val, y_val     = _xy_from_df(val_df)
+    return run_miner(X_train, y_train, X_val, y_val, **kwargs)
+
+def run_miner_val_only(
+    val_df: pd.DataFrame,
+    **kwargs
+) -> Tuple[pd.DataFrame, list[Dict[str, Any]], float]:
+    """
+    Legacy-style helper: mine using VAL both to bootstrap and to evaluate.
+    Handy if your app currently only passes a single labeled dataframe.
+    """
+    X_val, y_val = _xy_from_df(val_df)
+    return run_miner(X_val, y_val, X_val, y_val, **kwargs)
+
+# --------------------------------
+# CLI (zero-flag friendly)
+# --------------------------------
+def _read_parquet(path: str | Path) -> pd.DataFrame:
+    return pd.read_parquet(path)
+
+def main_cli():
+    parser = argparse.ArgumentParser(description="Mine fraud rules via bootstrapped decision trees.")
+    parser.add_argument("--train", type=str, default=TRAIN_PATH, help=f"Train reduced parquet [default: {TRAIN_PATH}]")
+    parser.add_argument("--val",   type=str, default=VAL_PATH,   help=f"Val   reduced parquet [default: {VAL_PATH}]")
+    parser.add_argument("--n-bootstraps", type=int, default=100, help="Number of bootstraps")
+    parser.add_argument("--max-depth", type=int, default=3)
+    parser.add_argument("--min-samples-leaf", type=int, default=5)
+    parser.add_argument("--min-votes-post", type=int, default=5)
+    parser.add_argument("--bootstrap-ratio", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--print-top", type=int, default=20, help="Rows to print from rule catalog")
+    args = parser.parse_args()
+
+    df_tr = _read_parquet(args.train)
+    df_va = _read_parquet(args.val)
+
+    rule_eval, cleaned, baseline_val = run_miner_from_frames(
+        df_tr, df_va,
+        n_bootstraps=args.n_bootstraps,
+        max_depth=args.max_depth,
+        min_samples_leaf=args.min_samples_leaf,
+        min_votes_post=args.min_votes_post,
+        bootstrap_ratio=args.bootstrap_ratio,
+        seed=args.seed,
+    )
+
+    print(rule_eval.head(args.print_top).to_string(index=False))
+    print("\nBaseline (VAL fraud rate):", f"{baseline_val:.4%}")
+
 if __name__ == "__main__":
-    # Running directly? Fall back to your project data path.
-    CURRENT_DIR = os.path.dirname(__file__)
-    PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
-    DATA_PATH = os.path.join(PROJECT_ROOT, "data", "ieee_fraud_features_encoded.parquet")
-
-    df = pd.read_parquet(DATA_PATH)
-    # (optionally drop columns like before if you want)
-    # df = df.drop(columns=["card1","card2","card3","card5"], errors="ignore")
-
-    rule_eval, cleaned, baseline_val = run_miner(df)
-    print(rule_eval.head())
-    print("Baseline (val):", baseline_val)
+    main_cli()
