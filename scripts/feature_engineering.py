@@ -1,10 +1,9 @@
 # scripts/engineer_features.py
 import os
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
-
 
 # ----------------------------
 # Paths
@@ -13,7 +12,10 @@ CURRENT_DIR = os.path.dirname(__file__)
 PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 
-RAW_PATH = os.path.join(DATA_DIR, "train_merged.parquet")
+IN_TRAIN = os.path.join(DATA_DIR, "fraud_train.parquet")
+IN_VAL   = os.path.join(DATA_DIR, "fraud_val.parquet")
+IN_TEST  = os.path.join(DATA_DIR, "fraud_test.parquet")
+
 OUT_TRAIN = os.path.join(DATA_DIR, "fraud_train_fe.parquet")
 OUT_VAL   = os.path.join(DATA_DIR, "fraud_val_fe.parquet")
 OUT_TEST  = os.path.join(DATA_DIR, "fraud_test_fe.parquet")
@@ -21,33 +23,19 @@ OUT_TEST  = os.path.join(DATA_DIR, "fraud_test_fe.parquet")
 # ----------------------------
 # Config
 # ----------------------------
-TRAIN_FRAC = 0.70
-VAL_FRAC   = 0.15  # test = remainder
 ORIGIN_TS  = pd.Timestamp("2017-01-01")  # arbitrary; only diffs matter
 
 # Shrunk z-score params
 SHRINK_K = 20      # weight prior strength
 Z_EPS    = 0.25    # minimum std on log scale
-COHORT_COL = "card2"  # shrink per-card1 toward issuer cohort by default
+COHORT_COL = "card2"  # shrink per-card1 toward this cohort by default
+
+# If True, pass *train* as "history" when computing val/test features (past-only, no future leakage)
+WARM_START_VAL_TEST = False
 
 
 # ----------------------------
-# Utils
-# ----------------------------
-def chronological_split(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    assert "TransactionDT" in df.columns and "isFraud" in df.columns
-    d = df.sort_values(["TransactionDT", "TransactionID"]).reset_index(drop=True)
-    n = len(d)
-    cut_tr = int(n * TRAIN_FRAC)
-    cut_va = int(n * (TRAIN_FRAC + VAL_FRAC))
-    train = d.iloc[:cut_tr].copy()
-    val   = d.iloc[cut_tr:cut_va].copy()
-    test  = d.iloc[cut_va:].copy()
-    return train, val, test
-
-
-# ----------------------------
-# Engineered feature builders
+# Feature primitives (time-safe within a frame)
 # ----------------------------
 def add_calendar_features(d: pd.DataFrame) -> pd.DataFrame:
     d["ts"] = ORIGIN_TS + pd.to_timedelta(d["TransactionDT"], unit="s")
@@ -59,23 +47,21 @@ def add_calendar_features(d: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_card_velocity_and_recency(d: pd.DataFrame) -> pd.DataFrame:
-    # 1) Previous timestamp per card (no apply; no warnings)
+    # previous timestamp per card
     prev_ts = d.groupby("card1")["ts"].shift(1)
 
     # minutes since previous txn; large sentinel if no history
     mins_since_prev = (d["ts"] - prev_ts).dt.total_seconds() / 60.0
     d["mins_since_prev_card1"] = mins_since_prev.fillna(1e9).astype("float32")
 
-    # 2) Time-based rolling features on a DatetimeIndex
+    # time-windowed counts/sums using DatetimeIndex; exclude current row with closed="left"
     d_idx = d.set_index("ts")
     g = d_idx.groupby("card1", group_keys=False)
 
-    # exclude current row with closed='left'
     ct_1d  = g["TransactionID"].rolling("1D", closed="left").count()
     ct_7d  = g["TransactionID"].rolling("7D", closed="left").count()
     sum_1d = g["TransactionAmt"].rolling("1D", closed="left").sum()
 
-    # assign by position to avoid label reindex with duplicate datetime index
     d["card1_txn_ct_1d"]  = ct_1d.astype("float32").fillna(0).to_numpy()
     d["card1_txn_ct_7d"]  = ct_7d.astype("float32").fillna(0).to_numpy()
     d["card1_amt_sum_1d"] = sum_1d.astype("float32").fillna(0).to_numpy()
@@ -83,28 +69,29 @@ def add_card_velocity_and_recency(d: pd.DataFrame) -> pd.DataFrame:
     return d
 
 
+def _expanding_stats(series: pd.Series) -> Tuple[pd.Series, pd.Series]:
+    # returns (mean_prev, std_prev) using *past only* (shifted expanding)
+    mean_prev = series.expanding().mean().shift(1)
+    var_prev  = series.expanding().var(ddof=0).shift(1)
+    std_prev  = np.sqrt(var_prev.clip(lower=0))
+    return mean_prev, std_prev
+
+
 def add_shrunk_amount_z(d: pd.DataFrame,
                         cohort_col: str = COHORT_COL,
                         k: int = SHRINK_K,
                         eps: float = Z_EPS) -> pd.DataFrame:
-    # Ensure chronological order and stable index
-    d = d.sort_values(["TransactionDT", "TransactionID"]).reset_index(drop=True)
-
-    # Log-amount for approximate normality
     d["logAmt"] = np.log1p(d["TransactionAmt"]).astype("float32")
     log_sq = (d["logAmt"] ** 2).astype("float32")
 
     # ---- Global expanding stats (past-only)
-    ones = pd.Series(1, index=d.index)
-    d["glob_n_prev"]    = ones.expanding().count().shift(1).fillna(0)
-    d["glob_mean_prev"] = d["logAmt"].expanding().mean().shift(1)
-    d["glob_var_prev"]  = d["logAmt"].expanding().var(ddof=0).shift(1)
-    d["glob_std_prev"]  = np.sqrt(d["glob_var_prev"].clip(lower=0)).fillna(d["logAmt"].std()).astype("float32")
+    glob_mean_prev, glob_std_prev = _expanding_stats(d["logAmt"])
+    d["glob_mean_prev"] = glob_mean_prev
+    d["glob_std_prev"]  = glob_std_prev.fillna(d["logAmt"].std())
 
-    # ---- Cohort stats (issuer, product, etc.)
+    # ---- Cohort stats (past-only)
     if cohort_col in d.columns:
         keyH = d[cohort_col]
-
         nH     = d.groupby(cohort_col).cumcount()                                # past count in cohort
         sumH   = d["logAmt"].groupby(keyH).cumsum() - d["logAmt"]                # past sum
         sum2H  = log_sq.groupby(keyH).cumsum() - log_sq                          # past sum of squares
@@ -115,18 +102,17 @@ def add_shrunk_amount_z(d: pd.DataFrame,
         varH = (sum2H / denomH) - (d["cohort_mean_prev"]**2)
         d["cohort_std_prev"]  = np.sqrt(varH.clip(lower=0)).astype("float32")
 
-        # Fill missing cohort stats with global
+        # fill with global where no cohort history
         d["cohort_mean_prev"] = d["cohort_mean_prev"].fillna(d["glob_mean_prev"])
         d["cohort_std_prev"]  = d["cohort_std_prev"].fillna(d["glob_std_prev"])
-        d["cohort_n_prev"]    = d["cohort_n_prev"].fillna(d["glob_n_prev"])
+        d["cohort_n_prev"]    = d["cohort_n_prev"].fillna(0)
     else:
-        d["cohort_n_prev"]    = d["glob_n_prev"]
+        d["cohort_n_prev"]    = 0
         d["cohort_mean_prev"] = d["glob_mean_prev"]
         d["cohort_std_prev"]  = d["glob_std_prev"]
 
-    # ---- Per-card1 expanding stats (past-only)
+    # ---- Per-card expanding stats (past-only)
     keyC = d["card1"]
-
     nC    = d.groupby("card1").cumcount()
     sumC  = d["logAmt"].groupby(keyC).cumsum() - d["logAmt"]
     sum2C = log_sq.groupby(keyC).cumsum() - log_sq
@@ -152,21 +138,15 @@ def add_shrunk_amount_z(d: pd.DataFrame,
     d["card1_amt_z_shrunk"] = z_star
     d["card1_has_history"]  = (d["card_n_prev"] > 0).astype("uint8")
 
-    # drop helper cols to keep the frame tidy
-    drop_helpers = [
-        "glob_n_prev","glob_mean_prev","glob_var_prev","glob_std_prev",
-        "cohort_n_prev","cohort_mean_prev","cohort_std_prev",
-        "card_n_prev","card_mean_prev","card_std_prev","logAmt"
-    ]
-    d.drop(columns=[c for c in drop_helpers if c in d.columns], inplace=True)
+    # drop helpers
+    d.drop(columns=["glob_mean_prev","glob_std_prev",
+                    "cohort_n_prev","cohort_mean_prev","cohort_std_prev",
+                    "card_n_prev","card_mean_prev","card_std_prev","logAmt"],
+           inplace=True, errors="ignore")
     return d
 
 
-
 def add_newness_flags(d: pd.DataFrame) -> pd.DataFrame:
-    # Work on sorted order
-    d = d.sort_values(["TransactionDT", "TransactionID"]).reset_index(drop=True)
-    # Fill missing as a token so they form their own group
     for col in ["DeviceInfo", "P_emaildomain"]:
         if col in d.columns:
             s = d[col].astype("object").fillna("__missing__")
@@ -184,49 +164,67 @@ def add_amount_rounding_flags(d: pd.DataFrame) -> pd.DataFrame:
     return d
 
 
-def add_engineered_features(df: pd.DataFrame) -> pd.DataFrame:
+# ----------------------------
+# Split-safe FE driver
+# ----------------------------
+def engineer_one_split(df: pd.DataFrame,
+                       history: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """
-    Adds all engineered features in a time-safe way.
-    IMPORTANT: compute on the FULL dataset before splitting so that
-    validation/test rows can 'see' past history (but never the future).
+    Engineer features using only *past* information.
+    If `history` is provided, it is concatenated BEFORE `df` solely to provide prior context;
+    the returned rows are only for `df` (history rows are dropped).
     """
-    d = df.copy()
+    # Build working frame: history (optional) + current split
+    if history is not None and len(history):
+        work = pd.concat([history, df], axis=0, ignore_index=True)
+    else:
+        work = df.copy()
 
-    # Ensure the sort first
-    d = d.sort_values(["TransactionDT", "TransactionID"]).reset_index(drop=True)
+    # Ensure time order
+    work = work.sort_values(["TransactionDT", "TransactionID"]).reset_index(drop=True)
 
     # Calendar from TransactionDT
-    d = add_calendar_features(d)
+    work = add_calendar_features(work)
 
-    # Velocity/recency per card1 (uses 'ts' as index)
-    d = add_card_velocity_and_recency(d)
+    # Velocity/recency per card1 (uses 'ts')
+    work = add_card_velocity_and_recency(work)
 
     # Shrunk z-score on log amount (per card1 toward cohort)
-    d = add_shrunk_amount_z(d, cohort_col=COHORT_COL, k=SHRINK_K, eps=Z_EPS)
+    work = add_shrunk_amount_z(work, cohort_col=COHORT_COL, k=SHRINK_K, eps=Z_EPS)
 
-    # Newness flags
-    d = add_newness_flags(d)
+    # Newness flags (first time seeing value in the *combined* history+current)
+    work = add_newness_flags(work)
 
     # Amount rounding patterns
-    d = add_amount_rounding_flags(d)
+    work = add_amount_rounding_flags(work)
 
     # Memory-friendly dtypes
     for col in ["card1_txn_ct_1d", "card1_txn_ct_7d", "card1_amt_sum_1d",
                 "mins_since_prev_card1", "card1_amt_z_shrunk"]:
-        if col in d.columns:
-            d[col] = d[col].astype("float32")
+        if col in work.columns:
+            work[col] = work[col].astype("float32")
 
     for col in ["hour_of_day", "day_of_week"]:
-        if col in d.columns:
-            d[col] = d[col].astype("int16")
+        if col in work.columns:
+            work[col] = work[col].astype("int16")
 
     for col in ["is_night","is_weekend","card1_has_history",
                 "is_first_seen_DeviceInfo","is_first_seen_P_emaildomain",
                 "is_amt_round","is_amt_99","is_amt_95"]:
-        if col in d.columns:
-            d[col] = d[col].astype("uint8")
+        if col in work.columns:
+            work[col] = work[col].astype("uint8")
 
-    return d
+    # Return only the rows belonging to the current split (drop history rows)
+    if history is not None and len(history):
+        out = work.iloc[len(history):].copy()
+    else:
+        out = work
+
+    # Clean up helper column
+    if "ts" in out.columns:
+        out.drop(columns=["ts"], inplace=True)
+
+    return out
 
 
 # ----------------------------
@@ -234,18 +232,25 @@ def add_engineered_features(df: pd.DataFrame) -> pd.DataFrame:
 # ----------------------------
 def main():
     os.makedirs(DATA_DIR, exist_ok=True)
-    df = pd.read_parquet(RAW_PATH)
 
-    # Sort & engineer features (time-safe, past-only)
-    df_fe = add_engineered_features(df)
+    train = pd.read_parquet(IN_TRAIN)
+    val   = pd.read_parquet(IN_VAL)
+    test  = pd.read_parquet(IN_TEST)
 
-    # Split AFTER feature engineering so val/test can see train history
-    train, val, test = chronological_split(df_fe)
+    # Strict isolation by default; flip WARM_START_VAL_TEST=True to let val/test see train's *past* only
+    if WARM_START_VAL_TEST:
+        train_fe = engineer_one_split(train, history=None)
+        val_fe   = engineer_one_split(val,   history=train)
+        test_fe  = engineer_one_split(test,  history=pd.concat([train, val], ignore_index=True))
+    else:
+        train_fe = engineer_one_split(train, history=None)
+        val_fe   = engineer_one_split(val,   history=None)
+        test_fe  = engineer_one_split(test,  history=None)
 
     # Save
-    train.to_parquet(OUT_TRAIN, index=False)
-    val.to_parquet(OUT_VAL, index=False)
-    test.to_parquet(OUT_TEST, index=False)
+    train_fe.to_parquet(OUT_TRAIN, index=False)
+    val_fe.to_parquet(OUT_VAL, index=False)
+    test_fe.to_parquet(OUT_TEST, index=False)
 
     # Quick summary
     def summarize(name, d):
@@ -261,9 +266,9 @@ def main():
     print("  - card1_amt_z_shrunk (hierarchical, log-amount), card1_has_history")
     print("  - is_first_seen_DeviceInfo, is_first_seen_P_emaildomain")
     print("  - is_amt_round, is_amt_99, is_amt_95")
-    summarize("TRAIN", train)
-    summarize("VAL",   val)
-    summarize("TEST",  test)
+    summarize("TRAIN", train_fe)
+    summarize("VAL",   val_fe)
+    summarize("TEST",  test_fe)
 
 
 if __name__ == "__main__":

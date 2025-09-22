@@ -13,22 +13,27 @@ CURRENT_DIR = os.path.dirname(__file__)
 PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 
-RAW_PATH          = os.path.join(DATA_DIR, "train_merged.parquet")
-FE_TRAIN_PATH     = os.path.join(DATA_DIR, "fraud_train_fe.parquet")
-FE_VAL_PATH       = os.path.join(DATA_DIR, "fraud_val_fe.parquet")
-FE_TEST_PATH      = os.path.join(DATA_DIR, "fraud_test_fe.parquet")
+# RAW Kaggle CSVs (put them in data/)
+TRAIN_TRANSACTION_CSV = os.path.join(DATA_DIR, "train_transaction.csv")
+TRAIN_IDENTITY_CSV    = os.path.join(DATA_DIR, "train_identity.csv")
+# NOTE: We will NOT use the Kaggle public test files anymore.
+# TEST_TRANSACTION_CSV  = os.path.join(DATA_DIR, "test_transaction.csv")
+# TEST_IDENTITY_CSV     = os.path.join(DATA_DIR, "test_identity.csv")
 
+# Outputs for downstream
 OUT_TRAIN = os.path.join(DATA_DIR, "fraud_train.parquet")
 OUT_VAL   = os.path.join(DATA_DIR, "fraud_val.parquet")
-OUT_TEST  = os.path.join(DATA_DIR, "fraud_test.parquet")
+OUT_TEST  = os.path.join(DATA_DIR, "fraud_test.parquet")  # this is the HOLDOUT from train, not Kaggle public test
 
 # =========================================
 # Config (tweakable)
 # =========================================
 COL_NA_THRESH = 0.80    # drop columns with >80% missing (decide using TRAIN only)
 ROW_NA_THRESH = 0.90    # drop rows with >90% missing (after column drops)
-TRAIN_FRAC    = 0.70    # only used in fallback mode (no FE files)
-VAL_FRAC      = 0.15
+
+# Chronological split fractions on the ORIGINAL TRAIN set
+TRAIN_FRAC = 0.70
+VAL_FRAC   = 0.15       # TEST_FRAC is implied as 1 - TRAIN_FRAC - VAL_FRAC
 
 DELTA_K_STD   = 7.0     # sentinel for D* = mean + k*std (per D col on TRAIN)
 TE_SMOOTH_K   = 50      # smoothed target encoding shrinkage strength
@@ -50,24 +55,36 @@ def is_d_col(c: str) -> bool: return bool(_D_COL_RE.match(c))
 # =========================================
 # IO & split helpers
 # =========================================
-def chronological_split(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    d = df.sort_values(["TransactionDT", "TransactionID"]).reset_index(drop=True)
+def load_merged_train_only() -> pd.DataFrame:
+    """Load *train* CSVs and merge *_transaction with *_identity on TransactionID."""
+    tr_tx = pd.read_csv(TRAIN_TRANSACTION_CSV)
+    tr_id = pd.read_csv(TRAIN_IDENTITY_CSV)
+    train_full = tr_tx.merge(tr_id, on="TransactionID", how="left")
+
+    # Basic checks
+    if "isFraud" not in train_full.columns:
+        raise ValueError("train_transaction.csv must contain 'isFraud' for training.")
+    if "TransactionDT" not in train_full.columns:
+        raise ValueError("Expected 'TransactionDT' in data.")
+
+    return train_full
+
+def chronological_split_train_val_test(train_full: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Chronologically split TRAIN into (train, val, test) in that order.
+    No use of Kaggle public test — this test is our holdout.
+    """
+    if not (0 < TRAIN_FRAC < 1) or not (0 <= VAL_FRAC < 1) or TRAIN_FRAC + VAL_FRAC < 0 or TRAIN_FRAC + VAL_FRAC >= 1:
+        raise ValueError("TRAIN_FRAC and VAL_FRAC must satisfy 0<train<1, 0<=val<1, and train+val<1.")
+
+    d = train_full.sort_values(["TransactionDT", "TransactionID"]).reset_index(drop=True)
     n = len(d)
     cut_tr = int(n * TRAIN_FRAC)
     cut_va = int(n * (TRAIN_FRAC + VAL_FRAC))
-    return d.iloc[:cut_tr].copy(), d.iloc[cut_tr:cut_va].copy(), d.iloc[cut_va:].copy()
-
-def load_splits() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, bool]:
-    """Load FE splits if present; otherwise fall back to RAW and split now."""
-    if all(os.path.exists(p) for p in [FE_TRAIN_PATH, FE_VAL_PATH, FE_TEST_PATH]):
-        train = pd.read_parquet(FE_TRAIN_PATH)
-        val   = pd.read_parquet(FE_VAL_PATH)
-        test  = pd.read_parquet(FE_TEST_PATH)
-        return train, val, test, True
-    else:
-        print("FE splits not found; falling back to RAW and performing split here.")
-        df = pd.read_parquet(RAW_PATH)
-        return chronological_split(df) + (False,)
+    train = d.iloc[:cut_tr].copy()
+    val   = d.iloc[cut_tr:cut_va].copy()
+    test  = d.iloc[cut_va:].copy()
+    return train, val, test
 
 # =========================================
 # Column dropping & row filtering
@@ -123,9 +140,9 @@ def target_encode_high_cardinals(train: pd.DataFrame, val: pd.DataFrame, test: p
         test[f"{col}_rate"]  = apply_smoothed_rate(test,  col, mapping, g_rate, rare)
         encoders[col] = {"global_rate": g_rate, "keys": list(mapping.keys()), "min_count": TE_MIN_COUNT}
         if DROP_ORIGINAL_AFTER_TE:
-            train.drop(columns=[col], inplace=True)
-            val.drop(columns=[col], inplace=True)
-            test.drop(columns=[col], inplace=True)
+            for df in (train, val, test):
+                if col in df.columns:
+                    df.drop(columns=[col], inplace=True)
     return train, val, test, encoders
 
 # =========================================
@@ -192,29 +209,29 @@ def apply_imputation(df: pd.DataFrame, params: Dict) -> pd.DataFrame:
 # Main
 # =========================================
 def preprocess_main():
-    # 0) Load splits (prefer FE splits)
-    train, val, test, from_fe = load_splits()
+    # 0) Load raw TRAIN only and merge identity
+    train_full = load_merged_train_only()
 
-    # 1) Drop V1..V339 (whether FE or RAW)
+    # 1) Chronological split TRAIN -> (train, val, test)
+    train, val, test = chronological_split_train_val_test(train_full)
+
+    # 2) Drop V1..V* everywhere
     train = drop_v_block(train)
     val   = drop_v_block(val)
     test  = drop_v_block(test)
 
-    # 2) If we fell back to RAW earlier, we just split; now continue as usual
-
-    # 3) Column drop list decided on TRAIN only
+    # 3) Decide column drops on TRAIN only; apply to all splits
     drop_cols = cols_to_drop_by_missing(train, COL_NA_THRESH)
     if drop_cols:
-        train.drop(columns=drop_cols, inplace=True, errors="ignore")
-        val.drop(columns=drop_cols, inplace=True, errors="ignore")
-        test.drop(columns=drop_cols, inplace=True, errors="ignore")
+        for df in (train, val, test):
+            df.drop(columns=drop_cols, inplace=True, errors="ignore")
 
     # 4) Optional row filtering (very empty rows)
     train = train[row_filter_mask(train, ROW_NA_THRESH)].reset_index(drop=True)
     val   = val[row_filter_mask(val, ROW_NA_THRESH)].reset_index(drop=True)
     test  = test[row_filter_mask(test, ROW_NA_THRESH)].reset_index(drop=True)
 
-    # 5) Target-encode high-card categoricals (TRAIN-only fit)
+    # 5) Target-encode high-card categoricals (fit on TRAIN; apply to VAL/TEST)
     present_high = [c for c in TE_HIGH_CARD_COLS if c in train.columns]
     train, val, test, te_info = target_encode_high_cardinals(train, val, test, present_high)
 
@@ -224,7 +241,7 @@ def preprocess_main():
     val_proc   = apply_imputation(val, params)
     test_proc  = apply_imputation(test, params)
 
-    # 7) Save
+    # 7) Save (these are your internal splits, all with labels)
     os.makedirs(DATA_DIR, exist_ok=True)
     train_proc.to_parquet(OUT_TRAIN, index=False)
     val_proc.to_parquet(OUT_VAL, index=False)
@@ -233,14 +250,15 @@ def preprocess_main():
     # 8) Summary
     def summarize(name: str, d: pd.DataFrame):
         rate = d["isFraud"].mean() if "isFraud" in d.columns else float("nan")
-        print(f"{name}: shape={d.shape}, fraud_rate={rate:.4f}")
+        print(f"{name}: shape={d.shape}, fraud_rate={rate:.4%}")
 
     print(f"Dropped columns (> {int(COL_NA_THRESH*100)}% NA): {len(drop_cols)}")
     if drop_cols: print("  Examples:", drop_cols[:10])
     if present_high:
-        print("Target-encoded (train-only):", present_high)
-        print("Created columns:", [f"{c}_rate" for c in present_high if f"{c}_rate" in train_proc.columns])
-    print("Loaded from FE splits?" , from_fe)
+        print("Target-encoded (fit on TRAIN):", present_high)
+        created = [f"{c}_rate" for c in present_high if f"{c}_rate" in train_proc.columns]
+        print("Created columns:", created)
+
     summarize("TRAIN", train_proc)
     summarize("VAL",   val_proc)
     summarize("TEST",  test_proc)

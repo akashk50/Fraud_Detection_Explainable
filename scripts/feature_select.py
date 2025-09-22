@@ -15,9 +15,9 @@ CURRENT_DIR = os.path.dirname(__file__)
 PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 
-TRAIN_PATH = os.path.join(DATA_DIR, "fraud_train.parquet")
-VAL_PATH   = os.path.join(DATA_DIR, "fraud_val.parquet")
-TEST_PATH  = os.path.join(DATA_DIR, "fraud_test.parquet")
+TRAIN_PATH = os.path.join(DATA_DIR, "fraud_train_fe.parquet")
+VAL_PATH   = os.path.join(DATA_DIR, "fraud_val_fe.parquet")
+TEST_PATH  = os.path.join(DATA_DIR, "fraud_test_fe.parquet")
 
 OUT_TRAIN  = os.path.join(DATA_DIR, "fraud_train_reduced.parquet")
 OUT_VAL    = os.path.join(DATA_DIR, "fraud_val_reduced.parquet")
@@ -58,163 +58,6 @@ PROTECT_ALWAYS: Set[str] = {
 ID_TIME_TARGET = {"TransactionID", "TransactionDT", "isFraud"}
 
 
-
-def read_parquet_robust(path: str) -> pd.DataFrame:
-    """
-    Read Parquet with multiple fallbacks:
-    1) pandas+pyarrow
-    2) pandas+fastparquet (if installed)
-    3) pyarrow.Table -> Python dict via to_pylist() (always works), then DataFrame
-    """
-    # 1) normal path
-    try:
-        return pd.read_parquet(path)  # engine=pyarrow
-    except Exception:
-        pass
-
-    # 2) try fastparquet if available
-    try:
-        return pd.read_parquet(path, engine="fastparquet")
-    except Exception:
-        pass
-
-    # 3) ultimate fallback: build columns manually from pyarrow
-    import pyarrow.parquet as pq
-    table = pq.read_table(path)
-    cols = {}
-    for name in table.schema.names:
-        arr = table[name]
-        py = arr.to_pylist()  # plain Python list (None for nulls)
-        # defensive: decode bytes -> str if any
-        if py and isinstance(py[0], (bytes, bytearray)):
-            py = [x.decode("utf-8", errors="ignore") if isinstance(x, (bytes, bytearray)) else x for x in py]
-        cols[name] = py
-    df = pd.DataFrame(cols)
-    return df
-
-def _sanitize_for_parquet(df: pd.DataFrame) -> pd.DataFrame:
-    """Coerce dtypes to parquet-friendly ones."""
-    out = df.copy()
-
-    # Critical IDs/time: force plain int64 with no NA
-    for c in ["TransactionID", "TransactionDT"]:
-        if c in out.columns:
-            out[c] = pd.to_numeric(out[c], errors="coerce").fillna(-1).astype("int64")
-
-    for c in out.columns:
-        dt = out[c].dtype
-        if c in ["TransactionID", "TransactionDT"]:
-            continue
-        # Booleans -> uint8 (pyarrow is fine with bool, but be consistent)
-        if pd.api.types.is_bool_dtype(dt):
-            out[c] = out[c].astype("uint8")
-        # Pandas nullable integers -> float64 if NA exists, else int64
-        elif str(dt).startswith("Int") and pd.api.types.is_integer_dtype(dt):
-            if out[c].isna().any():
-                out[c] = out[c].astype("float64")
-            else:
-                out[c] = out[c].astype("int64")
-        # Plain integers -> int64
-        elif pd.api.types.is_integer_dtype(dt):
-            out[c] = out[c].astype("int64")
-        # Floats -> float32 to keep size small (or float64 if you prefer)
-        elif pd.api.types.is_float_dtype(dt):
-            out[c] = out[c].astype("float32")
-        # Categoricals/objects -> string (Arrow handles this well)
-        elif isinstance(dt, CategoricalDtype):
-            out[c] = out[c].astype("string")
-
-        elif pd.api.types.is_object_dtype(dt):
-            out[c] = out[c].astype("string")
-    return out
-
-
-from pandas.api.types import CategoricalDtype  # make sure this import exists
-
-def _write_parquet_arrow_manual(df: pd.DataFrame, path: str) -> None:
-    """
-    Build Arrow arrays explicitly per column using Python lists.
-    This sidesteps ALL numpy/extension-array dtype quirks.
-    """
-    import pyarrow as pa, pyarrow.parquet as pq
-
-    arrays, names = [], []
-
-    for c in df.columns:
-        s = df[c]
-        names.append(c)
-        dt = s.dtype
-
-        # IDs/time: strict int64, no NA
-        if c in ("TransactionID", "TransactionDT"):
-            s = pd.to_numeric(s, errors="coerce").fillna(-1).astype("int64")
-            py = [int(v) for v in s.tolist()]
-            arr = pa.array(py, type=pa.int64())
-
-        elif pd.api.types.is_integer_dtype(dt) and not pd.api.types.is_unsigned_integer_dtype(dt):
-            s = pd.to_numeric(s, errors="coerce").fillna(-1).astype("int64")
-            py = [int(v) for v in s.tolist()]
-            arr = pa.array(py, type=pa.int64())
-
-        elif pd.api.types.is_unsigned_integer_dtype(dt):
-            s = pd.to_numeric(s, errors="coerce").fillna(0).astype("uint64")
-            py = [int(v) for v in s.tolist()]
-            arr = pa.array(py, type=pa.uint64())
-
-        elif pd.api.types.is_bool_dtype(dt):
-            py = [False if pd.isna(v) else bool(v) for v in s.tolist()]
-            arr = pa.array(py, type=pa.bool_())
-
-        elif pd.api.types.is_float_dtype(dt):
-            s = pd.to_numeric(s, errors="coerce")
-            py = [None if pd.isna(v) else float(v) for v in s.tolist()]
-            arr = pa.array(py, type=pa.float32())  # or pa.float64()
-
-        elif isinstance(dt, CategoricalDtype) or pd.api.types.is_object_dtype(dt) or pd.api.types.is_string_dtype(dt):
-            s = s.astype("string")
-            py = [None if pd.isna(v) else str(v) for v in s.tolist()]
-            arr = pa.array(py, type=pa.string())
-
-        else:
-            # last resort: stringify
-            py = [None if pd.isna(v) else str(v) for v in s.astype("string").tolist()]
-            arr = pa.array(py, type=pa.string())
-
-        arrays.append(arr)
-
-    table = pa.Table.from_arrays(arrays, names=names)
-    pq.write_table(table, path)
-
-
-
-def write_parquet_robust(df: pd.DataFrame, path: str) -> None:
-    # 1) try straight
-    try:
-        df.to_parquet(path, index=False)
-        return
-    except Exception:
-        pass
-
-    # 2) sanitize and try again
-    df2 = _sanitize_for_parquet(df)
-    try:
-        df2.to_parquet(path, index=False)
-        return
-    except Exception:
-        pass
-
-    # 3) try fastparquet if available
-    try:
-        df2.to_parquet(path, index=False, engine="fastparquet")
-        return
-    except Exception:
-        pass
-
-    # 4) ultimate fallback: manual Arrow writer
-    _write_parquet_arrow_manual(df2, path)
-
-
-
 def ensure_unique_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Ensure column names are unique (just in case) to avoid block-placement mismatches."""
     if df.columns.is_unique:
@@ -250,9 +93,9 @@ def family_of(col: str) -> str:
 # Utilities
 # ----------------------------
 def load_data() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    train = ensure_unique_columns(read_parquet_robust(TRAIN_PATH))
-    val   = ensure_unique_columns(read_parquet_robust(VAL_PATH))
-    test  = ensure_unique_columns(read_parquet_robust(TEST_PATH))
+    train = ensure_unique_columns(pd.read_parquet(TRAIN_PATH))
+    val   = ensure_unique_columns(pd.read_parquet(VAL_PATH))
+    test  = ensure_unique_columns(pd.read_parquet(TEST_PATH))
     sort_keys = ["TransactionDT", "TransactionID"]
     train = train.sort_values(sort_keys).reset_index(drop=True)
     val   = val.sort_values(sort_keys).reset_index(drop=True)
@@ -548,9 +391,9 @@ def main():
     }).to_csv(OUT_REPORT, index=False)
 
     # 7) Write reduced Parquets
-    write_parquet_robust(train[final_keep], OUT_TRAIN)
-    write_parquet_robust(val[final_keep],   OUT_VAL)
-    write_parquet_robust(test[final_keep],  OUT_TEST)
+    train[final_keep].to_parquet(OUT_TRAIN)
+    val[final_keep].to_parquet(OUT_VAL)
+    test[final_keep].to_parquet(OUT_TEST)
 
 
     print(f"Initial columns: {train.shape[1]} | After selection: {len(final_keep)} (incl. id/time/target).")
